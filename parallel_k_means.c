@@ -3,7 +3,7 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
-
+#include <omp.h>
 
 /* ---------- util CSV 1D: cada linha tem 1 número ---------- */
 static int count_rows(const char *path)
@@ -33,7 +33,6 @@ static int count_rows(const char *path)
     fclose(f);
     return rows;
 }
-
 
 static double *read_csv_1col(const char *path, int *n_out)
 {
@@ -74,7 +73,6 @@ static double *read_csv_1col(const char *path, int *n_out)
         if (only_ws)
             continue;
 
-        /* aceita vírgula/ponto-e-vírgula/espaco/tab, pega o primeiro token numérico */
         const char *delim = ",; \t";
         char *tok = strtok(line, delim);
         if (!tok)
@@ -94,7 +92,6 @@ static double *read_csv_1col(const char *path, int *n_out)
     return A;
 }
 
-
 static void write_assign_csv(const char *path, const int *assign, int N)
 {
     if (!path)
@@ -109,7 +106,6 @@ static void write_assign_csv(const char *path, const int *assign, int N)
         fprintf(f, "%d\n", assign[i]);
     fclose(f);
 }
-
 
 static void write_centroids_csv(const char *path, const double *C, int K)
 {
@@ -126,14 +122,12 @@ static void write_centroids_csv(const char *path, const double *C, int K)
     fclose(f);
 }
 
-
-
-
-/* ---------- k-means 1D ---------- */
-/* assignment: para cada X[i], encontra c com menor (X[i]-C[c])^2 */
+/* ---------- k-means 1D com OpenMP ---------- */
 static double assignment_step_1d(const double *X, const double *C, int *assign, int N, int K)
 {
     double sse = 0.0;
+
+    #pragma omp parallel for reduction(+:sse)
     for (int i = 0; i < N; i++)
     {
         int best = -1;
@@ -154,39 +148,46 @@ static double assignment_step_1d(const double *X, const double *C, int *assign, 
     return sse;
 }
 
-
-
-
-/* update: média dos pontos de cada cluster (1D)
-   se cluster vazio, copia X[0] (estratégia naive) */
 static void update_step_1d(const double *X, double *C, const int *assign, int N, int K)
 {
-    double *sum = (double *)calloc((size_t)K, sizeof(double));
-    int *cnt = (int *)calloc((size_t)K, sizeof(int));
-    if (!sum || !cnt)
-    {
-        fprintf(stderr, "Sem memoria no update\n");
-        exit(1);
+    int nthreads = omp_get_max_threads();
+
+    double **sum = malloc(nthreads * sizeof(double*));
+    int **cnt = malloc(nthreads * sizeof(int*));
+    for (int t = 0; t < nthreads; t++) {
+        sum[t] = calloc(K, sizeof(double));
+        cnt[t] = calloc(K, sizeof(int));
     }
 
-    for (int i = 0; i < N; i++)
+    #pragma omp parallel
     {
-        int a = assign[i];
-        cnt[a] += 1;
-        sum[a] += X[i];
+        int tid = omp_get_thread_num();
+        #pragma omp for
+        for (int i = 0; i < N; i++) {
+            int a = assign[i];
+            sum[tid][a] += X[i];
+            cnt[tid][a] += 1;
+        }
     }
-    for (int c = 0; c < K; c++)
-    {
-        if (cnt[c] > 0)
-            C[c] = sum[c] / (double)cnt[c];
-        else
-            C[c] = X[0]; /* simples: cluster vazio recebe o primeiro ponto */
+
+    // Combinar resultados das threads
+    for (int c = 0; c < K; c++) {
+        double s = 0.0;
+        int n = 0;
+        for (int t = 0; t < nthreads; t++) {
+            s += sum[t][c];
+            n += cnt[t][c];
+        }
+        C[c] = (n > 0) ? s / n : X[0];
+    }
+
+    for (int t = 0; t < nthreads; t++) {
+        free(sum[t]);
+        free(cnt[t]);
     }
     free(sum);
     free(cnt);
 }
-
-
 
 static void kmeans_1d(const double *X, double *C, int *assign,
                       int N, int K, int max_iter, double eps,
@@ -198,9 +199,7 @@ static void kmeans_1d(const double *X, double *C, int *assign,
     for (it = 0; it < max_iter; it++)
     {
         sse = assignment_step_1d(X, C, assign, N, K);
-        /* parada por variação relativa do SSE */
         double rel = fabs(sse - prev_sse) / (prev_sse > 0.0 ? prev_sse : 1.0);
-        
         if (rel < eps)
         {
             it++;
@@ -212,11 +211,6 @@ static void kmeans_1d(const double *X, double *C, int *assign,
     *iters_out = it;
     *sse_out = sse;
 }
-
-
-
-
-
 
 /* ---------- main ---------- */
 int main(int argc, char **argv)
@@ -259,7 +253,7 @@ int main(int argc, char **argv)
     clock_t t1 = clock();
     double ms = 1000.0 * (double)(t1 - t0) / (double)CLOCKS_PER_SEC;
 
-    printf("K-means 1D (naive)\n");
+    printf("K-means 1D (OpenMP)\n");
     printf("N=%d K=%d max_iter=%d eps=%g\n", N, K, max_iter, eps);
     printf("Iterações: %d | SSE final: %.6f | Tempo: %.1f ms\n", iters, sse, ms);
 
