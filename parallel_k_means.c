@@ -127,7 +127,7 @@ static double assignment_step_1d(const double *X, const double *C, int *assign, 
 {
     double sse = 0.0;
 
-    #pragma omp parallel for reduction(+:sse)
+#pragma omp parallel for reduction(+ : sse)
     for (int i = 0; i < N; i++)
     {
         int best = -1;
@@ -152,18 +152,20 @@ static void update_step_1d(const double *X, double *C, const int *assign, int N,
 {
     int nthreads = omp_get_max_threads();
 
-    double **sum = malloc(nthreads * sizeof(double*));
-    int **cnt = malloc(nthreads * sizeof(int*));
-    for (int t = 0; t < nthreads; t++) {
+    double **sum = malloc(nthreads * sizeof(double *));
+    int **cnt = malloc(nthreads * sizeof(int *));
+    for (int t = 0; t < nthreads; t++)
+    {
         sum[t] = calloc(K, sizeof(double));
         cnt[t] = calloc(K, sizeof(int));
     }
 
-    #pragma omp parallel
+#pragma omp parallel
     {
         int tid = omp_get_thread_num();
-        #pragma omp for
-        for (int i = 0; i < N; i++) {
+#pragma omp for
+        for (int i = 0; i < N; i++)
+        {
             int a = assign[i];
             sum[tid][a] += X[i];
             cnt[tid][a] += 1;
@@ -171,17 +173,20 @@ static void update_step_1d(const double *X, double *C, const int *assign, int N,
     }
 
     // Combinar resultados das threads
-    for (int c = 0; c < K; c++) {
+    for (int c = 0; c < K; c++)
+    {
         double s = 0.0;
         int n = 0;
-        for (int t = 0; t < nthreads; t++) {
+        for (int t = 0; t < nthreads; t++)
+        {
             s += sum[t][c];
             n += cnt[t][c];
         }
         C[c] = (n > 0) ? s / n : X[0];
     }
 
-    for (int t = 0; t < nthreads; t++) {
+    for (int t = 0; t < nthreads; t++)
+    {
         free(sum[t]);
         free(cnt[t]);
     }
@@ -260,6 +265,99 @@ int main(int argc, char **argv)
     write_assign_csv(outAssign, assign, N);
     write_centroids_csv(outCentroid, C, K);
 
+    // ===== MEDIÇÃO: Fim total =====
+    clock_t t_total_end = clock();
+
+    // ===== CÁLCULOS DE MÉTRICAS =====
+    double ms_total = 1000.0 * (double)(t_total_end - t_total_start) / (double)CLOCKS_PER_SEC;
+    double ms_kmeans = 1000.0 * (double)(t_kmeans_end - t_kmeans_start) / (double)CLOCKS_PER_SEC;
+    double ms_per_iter = (iters > 0) ? (ms_kmeans / (double)iters) : 0.0;
+
+    // Throughput
+    double total_ops = (double)N * (double)K * (double)iters;
+    double throughput_ops = (ms_kmeans > 0) ? (total_ops / (ms_kmeans / 1000.0)) : 0.0;
+    double throughput_points = (ms_kmeans > 0) ? ((double)N * (double)iters / (ms_kmeans / 1000.0)) : 0.0;
+
+    // SSE inicial e final
+    double sse_initial = (iters > 0) ? sse_history[0] : 0.0;
+    double sse_final = sse;
+    double sse_reduction = ((sse_initial > 0) ? ((sse_initial - sse_final) / sse_initial * 100.0) : 0.0);
+
+    // ===== IMPRESSÃO DE RESULTADOS =====
+    printf("\n========================================\n");
+    printf("K-means 1D (OpenMP PARALLEL)\n");
+    printf("========================================\n");
+    printf("Dataset: N=%d pontos | K=%d clusters\n", N, K);
+    printf("Parametros: max_iter=%d | eps=%g\n", max_iter, eps);
+    printf("Threads: %d\n", num_threads);
+    printf("----------------------------------------\n");
+    printf("ALGORITMO:\n");
+    printf("  Iteracoes realizadas: %d\n", iters);
+    printf("  SSE inicial:  %.6f\n", sse_initial);
+    printf("  SSE final:    %.6f\n", sse_final);
+    printf("  Reducao SSE:  %.2f%%\n", sse_reduction);
+    printf("----------------------------------------\n");
+    printf("TEMPO:\n");
+    printf("  Tempo total (com I/O):  %.3f ms\n", ms_total);
+    printf("  Tempo k-means (puro):   %.3f ms\n", ms_kmeans);
+    printf("  Tempo por iteracao:     %.3f ms\n", ms_per_iter);
+    printf("----------------------------------------\n");
+    printf("THROUGHPUT:\n");
+    printf("  Operacoes totais:       %.2e\n", total_ops);
+    printf("  Operacoes/segundo:      %.2e ops/s\n", throughput_ops);
+    printf("  Pontos/segundo:         %.2e pts/s\n", throughput_points);
+    printf("========================================\n");
+
+    // ===== VALIDAÇÃO: SSE não deve crescer =====
+    printf("\nVALIDACAO (SSE monotonico):\n");
+    int monotonic = 1;
+    for (int i = 1; i < iters; i++)
+    {
+        if (sse_history[i] > sse_history[i - 1] + 1e-9) // tolerância numérica
+        {
+            printf("  AVISO: SSE aumentou na iteracao %d (%.6f -> %.6f)\n",
+                   i, sse_history[i - 1], sse_history[i]);
+            monotonic = 0;
+        }
+    }
+    if (monotonic)
+        printf("  SSE monotonicamente nao crescente\n");
+
+    // ===== SALVAR MÉTRICAS EM CSV (para análise posterior) =====
+    char metrics_filename[256];
+    snprintf(metrics_filename, sizeof(metrics_filename),
+             "metrics_parallel_log/metrics_parallel_t%d.csv", num_threads);
+
+    FILE *metrics = fopen(metrics_filename, "w");
+    if (metrics)
+    {
+        fprintf(metrics, "N,K,max_iter,eps,threads,iterations,sse_initial,sse_final,");
+        fprintf(metrics, "time_total_ms,time_kmeans_ms,time_per_iter_ms,");
+        fprintf(metrics, "throughput_ops_per_sec,throughput_points_per_sec\n");
+
+        fprintf(metrics, "%d,%d,%d,%g,%d,%d,%.6f,%.6f,%.3f,%.3f,%.3f,%.2e,%.2e\n",
+                N, K, max_iter, eps, num_threads, iters, sse_initial, sse_final,
+                ms_total, ms_kmeans, ms_per_iter, throughput_ops, throughput_points);
+        fclose(metrics);
+        printf("\n Metricas salvas em: %s\n", metrics_filename);
+    }
+
+    // ===== SALVAR HISTÓRICO SSE =====
+    char history_filename[256];
+    snprintf(history_filename, sizeof(history_filename),
+             "metrics_parallel_log/sse_history_parallel_t%d.csv", num_threads);
+
+    FILE *hist = fopen(history_filename, "w");
+    if (hist)
+    {
+        fprintf(hist, "iteration,sse\n");
+        for (int i = 0; i < iters; i++)
+            fprintf(hist, "%d,%.6f\n", i, sse_history[i]);
+        fclose(hist);
+        printf(" Historico SSE salvo em: %s\n", history_filename);
+    }
+
+    free(sse_history);
     free(assign);
     free(X);
     free(C);
