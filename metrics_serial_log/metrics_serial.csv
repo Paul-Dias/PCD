@@ -1,0 +1,2 @@
+N,K,max_iter,eps,iterations,sse_initial,sse_final,time_total_ms,time_kmeans_ms,time_per_iter_ms,throughput_ops_per_sec,throughput_points_per_sec
+500000,50,100,0.0001,36,1704495.120001,191730.983684,3432.000,3114.000,86.500,2.89e+008,5.78e+006

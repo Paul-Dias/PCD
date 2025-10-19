@@ -4,7 +4,6 @@
 #include <math.h>
 #include <time.h>
 
-
 /* ---------- util CSV 1D: cada linha tem 1 número ---------- */
 static int count_rows(const char *path)
 {
@@ -33,7 +32,6 @@ static int count_rows(const char *path)
     fclose(f);
     return rows;
 }
-
 
 static double *read_csv_1col(const char *path, int *n_out)
 {
@@ -94,7 +92,6 @@ static double *read_csv_1col(const char *path, int *n_out)
     return A;
 }
 
-
 static void write_assign_csv(const char *path, const int *assign, int N)
 {
     if (!path)
@@ -110,7 +107,6 @@ static void write_assign_csv(const char *path, const int *assign, int N)
     fclose(f);
 }
 
-
 static void write_centroids_csv(const char *path, const double *C, int K)
 {
     if (!path)
@@ -125,9 +121,6 @@ static void write_centroids_csv(const char *path, const double *C, int K)
         fprintf(f, "%.6f\n", C[c]);
     fclose(f);
 }
-
-
-
 
 /* ---------- k-means 1D ---------- */
 /* assignment: para cada X[i], encontra c com menor (X[i]-C[c])^2 */
@@ -153,9 +146,6 @@ static double assignment_step_1d(const double *X, const double *C, int *assign, 
     }
     return sse;
 }
-
-
-
 
 /* update: média dos pontos de cada cluster (1D)
    se cluster vazio, copia X[0] (estratégia naive) */
@@ -186,21 +176,29 @@ static void update_step_1d(const double *X, double *C, const int *assign, int N,
     free(cnt);
 }
 
-
-
 static void kmeans_1d(const double *X, double *C, int *assign,
                       int N, int K, int max_iter, double eps,
-                      int *iters_out, double *sse_out)
+                      int *iters_out, double *sse_out, double **sse_history)
 {
+    double *history = (double *)malloc((size_t)(max_iter + 1) * sizeof(double));
+    if (!history)
+    {
+        fprintf(stderr, "Sem memoria para histórico SSE\n");
+        exit(1);
+    }
+
     double prev_sse = 1e300;
     double sse = 0.0;
     int it;
+
     for (it = 0; it < max_iter; it++)
     {
         sse = assignment_step_1d(X, C, assign, N, K);
+        history[it] = sse; // Salva SSE de cada iteração
+
         /* parada por variação relativa do SSE */
         double rel = fabs(sse - prev_sse) / (prev_sse > 0.0 ? prev_sse : 1.0);
-        
+
         if (rel < eps)
         {
             it++;
@@ -209,14 +207,11 @@ static void kmeans_1d(const double *X, double *C, int *assign,
         update_step_1d(X, C, assign, N, K);
         prev_sse = sse;
     }
+
     *iters_out = it;
     *sse_out = sse;
+    *sse_history = history;
 }
-
-
-
-
-
 
 /* ---------- main ---------- */
 int main(int argc, char **argv)
@@ -240,6 +235,9 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    // ===== MEDIÇÃO: Início total =====
+    clock_t t_total_start = clock();
+
     int N = 0, K = 0;
     double *X = read_csv_1col(pathX, &N);
     double *C = read_csv_1col(pathC, &K);
@@ -252,20 +250,104 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    clock_t t0 = clock();
+    // ===== MEDIÇÃO: Início k-means (sem I/O) =====
+    clock_t t_kmeans_start = clock();
+
     int iters = 0;
     double sse = 0.0;
-    kmeans_1d(X, C, assign, N, K, max_iter, eps, &iters, &sse);
-    clock_t t1 = clock();
-    double ms = 1000.0 * (double)(t1 - t0) / (double)CLOCKS_PER_SEC;
+    double *sse_history = NULL;
+    kmeans_1d(X, C, assign, N, K, max_iter, eps, &iters, &sse, &sse_history);
 
-    printf("K-means 1D (naive)\n");
-    printf("N=%d K=%d max_iter=%d eps=%g\n", N, K, max_iter, eps);
-    printf("Iterações: %d | SSE final: %.6f | Tempo: %.1f ms\n", iters, sse, ms);
+    // ===== MEDIÇÃO: Fim k-means =====
+    clock_t t_kmeans_end = clock();
 
     write_assign_csv(outAssign, assign, N);
     write_centroids_csv(outCentroid, C, K);
 
+    // ===== MEDIÇÃO: Fim total =====
+    clock_t t_total_end = clock();
+
+    // ===== CÁLCULOS DE MÉTRICAS =====
+    double ms_total = 1000.0 * (double)(t_total_end - t_total_start) / (double)CLOCKS_PER_SEC;
+    double ms_kmeans = 1000.0 * (double)(t_kmeans_end - t_kmeans_start) / (double)CLOCKS_PER_SEC;
+    double ms_per_iter = (iters > 0) ? (ms_kmeans / (double)iters) : 0.0;
+
+    // Throughput
+    double total_ops = (double)N * (double)K * (double)iters;
+    double throughput_ops = (ms_kmeans > 0) ? (total_ops / (ms_kmeans / 1000.0)) : 0.0;
+    double throughput_points = (ms_kmeans > 0) ? ((double)N * (double)iters / (ms_kmeans / 1000.0)) : 0.0;
+
+    // SSE inicial e final
+    double sse_initial = (iters > 0) ? sse_history[0] : 0.0;
+    double sse_final = sse;
+    double sse_reduction = ((sse_initial > 0) ? ((sse_initial - sse_final) / sse_initial * 100.0) : 0.0);
+
+    // ===== IMPRESSÃO DE RESULTADOS =====
+    printf("\n========================================\n");
+    printf("K-means 1D (SERIAL - Baseline)\n");
+    printf("========================================\n");
+    printf("Dataset: N=%d pontos | K=%d clusters\n", N, K);
+    printf("Parametros: max_iter=%d | eps=%g\n", max_iter, eps);
+    printf("----------------------------------------\n");
+    printf("ALGORITMO:\n");
+    printf("  Iteracoes realizadas: %d\n", iters);
+    printf("  SSE inicial:  %.6f\n", sse_initial);
+    printf("  SSE final:    %.6f\n", sse_final);
+    printf("  Reducao SSE:  %.2f%%\n", sse_reduction);
+    printf("----------------------------------------\n");
+    printf("TEMPO:\n");
+    printf("  Tempo total (com I/O):  %.3f ms\n", ms_total);
+    printf("  Tempo k-means (puro):   %.3f ms\n", ms_kmeans);
+    printf("  Tempo por iteracao:     %.3f ms\n", ms_per_iter);
+    printf("----------------------------------------\n");
+    printf("THROUGHPUT:\n");
+    printf("  Operacoes totais:       %.2e\n", total_ops);
+    printf("  Operacoes/segundo:      %.2e ops/s\n", throughput_ops);
+    printf("  Pontos/segundo:         %.2e pts/s\n", throughput_points);
+    printf("========================================\n");
+
+    // ===== VALIDAÇÃO: SSE não deve crescer =====
+    printf("\nVALIDACAO (SSE monotonico):\n");
+    int monotonic = 1;
+    for (int i = 1; i < iters; i++)
+    {
+        if (sse_history[i] > sse_history[i - 1] + 1e-9) // tolerância numérica
+        {
+            printf("  AVISO: SSE aumentou na iteracao %d (%.6f -> %.6f)\n",
+                   i, sse_history[i - 1], sse_history[i]);
+            monotonic = 0;
+        }
+    }
+    if (monotonic)
+        printf("SSE monotonicamente nao crescente\n");
+
+    // ===== SALVAR MÉTRICAS EM CSV (para análise posterior) =====
+    FILE *metrics = fopen("metrics_serial_log/metrics_serial.csv", "w");
+    if (metrics)
+    {
+        fprintf(metrics, "N,K,max_iter,eps,iterations,sse_initial,sse_final,");
+        fprintf(metrics, "time_total_ms,time_kmeans_ms,time_per_iter_ms,");
+        fprintf(metrics, "throughput_ops_per_sec,throughput_points_per_sec\n");
+
+        fprintf(metrics, "%d,%d,%d,%g,%d,%.6f,%.6f,%.3f,%.3f,%.3f,%.2e,%.2e\n",
+                N, K, max_iter, eps, iters, sse_initial, sse_final,
+                ms_total, ms_kmeans, ms_per_iter, throughput_ops, throughput_points);
+        fclose(metrics);
+        printf("\n Metricas salvas em: metrics_serial.csv\n");
+    }
+
+    // ===== SALVAR HISTÓRICO SSE =====
+    FILE *hist = fopen("metrics_serial_log/sse_history_serial.csv", "w");
+    if (hist)
+    {
+        fprintf(hist, "iteration,sse\n");
+        for (int i = 0; i < iters; i++)
+            fprintf(hist, "%d,%.6f\n", i, sse_history[i]);
+        fclose(hist);
+        printf(" Historico SSE salvo em: sse_history_serial.csv\n");
+    }
+
+    free(sse_history);
     free(assign);
     free(X);
     free(C);
