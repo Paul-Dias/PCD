@@ -196,14 +196,16 @@ static void update_step_1d(const double *X, double *C, const int *assign, int N,
 
 static void kmeans_1d(const double *X, double *C, int *assign,
                       int N, int K, int max_iter, double eps,
-                      int *iters_out, double *sse_out)
+                      int *iters_out, double *sse_out, double **sse_history_out)
 {
+    double *sse_history = malloc(max_iter * sizeof(double));
     double prev_sse = 1e300;
     double sse = 0.0;
     int it;
     for (it = 0; it < max_iter; it++)
     {
         sse = assignment_step_1d(X, C, assign, N, K);
+        sse_history[it] = sse;
         double rel = fabs(sse - prev_sse) / (prev_sse > 0.0 ? prev_sse : 1.0);
         if (rel < eps)
         {
@@ -215,6 +217,7 @@ static void kmeans_1d(const double *X, double *C, int *assign,
     }
     *iters_out = it;
     *sse_out = sse;
+    *sse_history_out = sse_history;
 }
 
 /* ---------- main ---------- */
@@ -222,8 +225,9 @@ int main(int argc, char **argv)
 {
     if (argc < 3)
     {
-        printf("Uso: %s dados.csv centroides_iniciais.csv [max_iter=50] [eps=1e-4] [assign.csv] [centroids.csv]\n", argv[0]);
+        printf("Uso: %s dados.csv centroides_iniciais.csv [max_iter=50] [eps=1e-4] [assign.csv] [centroids.csv] [baseline_ms=0]\n", argv[0]);
         printf("Obs: arquivos CSV com 1 coluna (1 valor por linha), sem cabeçalho.\n");
+        printf("     baseline_ms: tempo sequencial (1 thread) em ms para calcular speedup\n");
         return 1;
     }
     const char *pathX = argv[1];
@@ -232,6 +236,7 @@ int main(int argc, char **argv)
     double eps = (argc > 4) ? atof(argv[4]) : 1e-4;
     const char *outAssign = (argc > 5) ? argv[5] : NULL;
     const char *outCentroid = (argc > 6) ? argv[6] : NULL;
+    double baseline_time_ms = (argc > 7) ? atof(argv[7]) : 0.0; // NOVO: tempo baseline
 
     if (max_iter <= 0 || eps <= 0.0)
     {
@@ -251,16 +256,22 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    clock_t t0 = clock();
+    // ===== MEDIÇÃO: Início total =====
+    clock_t t_total_start = clock();
+
+    // Obter número de threads
+    int num_threads = omp_get_max_threads();
+
+    // ===== MEDIÇÃO: Início k-means puro =====
+    clock_t t_kmeans_start = clock();
+
     int iters = 0;
     double sse = 0.0;
-    kmeans_1d(X, C, assign, N, K, max_iter, eps, &iters, &sse);
-    clock_t t1 = clock();
-    double ms = 1000.0 * (double)(t1 - t0) / (double)CLOCKS_PER_SEC;
+    double *sse_history = NULL;
+    kmeans_1d(X, C, assign, N, K, max_iter, eps, &iters, &sse, &sse_history);
 
-    printf("K-means 1D (OpenMP)\n");
-    printf("N=%d K=%d max_iter=%d eps=%g\n", N, K, max_iter, eps);
-    printf("Iterações: %d | SSE final: %.6f | Tempo: %.1f ms\n", iters, sse, ms);
+    // ===== MEDIÇÃO: Fim k-means =====
+    clock_t t_kmeans_end = clock();
 
     write_assign_csv(outAssign, assign, N);
     write_centroids_csv(outCentroid, C, K);
@@ -272,6 +283,10 @@ int main(int argc, char **argv)
     double ms_total = 1000.0 * (double)(t_total_end - t_total_start) / (double)CLOCKS_PER_SEC;
     double ms_kmeans = 1000.0 * (double)(t_kmeans_end - t_kmeans_start) / (double)CLOCKS_PER_SEC;
     double ms_per_iter = (iters > 0) ? (ms_kmeans / (double)iters) : 0.0;
+
+    // Speedup e Eficiência
+    double speedup = (baseline_time_ms > 0) ? (baseline_time_ms / ms_kmeans) : 0.0;
+    double efficiency = (num_threads > 0 && speedup > 0) ? (speedup / num_threads * 100.0) : 0.0;
 
     // Throughput
     double total_ops = (double)N * (double)K * (double)iters;
@@ -306,6 +321,11 @@ int main(int argc, char **argv)
     printf("  Operacoes totais:       %.2e\n", total_ops);
     printf("  Operacoes/segundo:      %.2e ops/s\n", throughput_ops);
     printf("  Pontos/segundo:         %.2e pts/s\n", throughput_points);
+    printf("----------------------------------------\n");
+    printf("SPEEDUP:\n");
+    printf("  Tempo base (1 thread):  %.3f ms\n", baseline_time_ms);
+    printf("  Speedup:                %.2fx\n", speedup);
+    printf("  Eficiencia:             %.2f%%\n", efficiency);
     printf("========================================\n");
 
     // ===== VALIDAÇÃO: SSE não deve crescer =====
@@ -313,7 +333,7 @@ int main(int argc, char **argv)
     int monotonic = 1;
     for (int i = 1; i < iters; i++)
     {
-        if (sse_history[i] > sse_history[i - 1] + 1e-9) // tolerância numérica
+        if (sse_history[i] > sse_history[i - 1] + 1e-9)
         {
             printf("  AVISO: SSE aumentou na iteracao %d (%.6f -> %.6f)\n",
                    i, sse_history[i - 1], sse_history[i]);
@@ -323,7 +343,7 @@ int main(int argc, char **argv)
     if (monotonic)
         printf("  SSE monotonicamente nao crescente\n");
 
-    // ===== SALVAR MÉTRICAS EM CSV (para análise posterior) =====
+    // ===== SALVAR MÉTRICAS EM CSV =====
     char metrics_filename[256];
     snprintf(metrics_filename, sizeof(metrics_filename),
              "metrics_parallel_log/metrics_parallel_t%d.csv", num_threads);
@@ -333,13 +353,15 @@ int main(int argc, char **argv)
     {
         fprintf(metrics, "N,K,max_iter,eps,threads,iterations,sse_initial,sse_final,");
         fprintf(metrics, "time_total_ms,time_kmeans_ms,time_per_iter_ms,");
-        fprintf(metrics, "throughput_ops_per_sec,throughput_points_per_sec\n");
+        fprintf(metrics, "throughput_ops_per_sec,throughput_points_per_sec,");
+        fprintf(metrics, "baseline_time_ms,speedup,efficiency_percent\n");
 
-        fprintf(metrics, "%d,%d,%d,%g,%d,%d,%.6f,%.6f,%.3f,%.3f,%.3f,%.2e,%.2e\n",
+        fprintf(metrics, "%d,%d,%d,%g,%d,%d,%.6f,%.6f,%.3f,%.3f,%.3f,%.2e,%.2e,%.3f,%.2f,%.2f\n",
                 N, K, max_iter, eps, num_threads, iters, sse_initial, sse_final,
-                ms_total, ms_kmeans, ms_per_iter, throughput_ops, throughput_points);
+                ms_total, ms_kmeans, ms_per_iter, throughput_ops, throughput_points,
+                baseline_time_ms, speedup, efficiency);
         fclose(metrics);
-        printf("\n Metricas salvas em: %s\n", metrics_filename);
+        printf("\nMetricas salvas em: %s\n", metrics_filename);
     }
 
     // ===== SALVAR HISTÓRICO SSE =====
@@ -354,7 +376,7 @@ int main(int argc, char **argv)
         for (int i = 0; i < iters; i++)
             fprintf(hist, "%d,%.6f\n", i, sse_history[i]);
         fclose(hist);
-        printf(" Historico SSE salvo em: %s\n", history_filename);
+        printf("Historico SSE salvo em: %s\n", history_filename);
     }
 
     free(sse_history);
