@@ -5,8 +5,8 @@
 #include <time.h>
 #include <cuda_runtime.h>
 
-// Simple CUDA K-means 1D
-// Usage: cuda_kmeans data.csv centroids.csv [max_iter=50] [eps=1e-4] [update=host|gpu] [block=256] [assign_out] [centroids_out]
+// Fully Parallelized CUDA K-means 1D - NO LOOPS IN GPU THREADS!
+// Usage: cuda_kmeans data.csv centroids.csv [max_iter=50] [eps=1e-4] [update=gpu] [block=256] [assign_out] [centroids_out]
 
 #define CHECK(call)                                                                                    \
     do                                                                                                 \
@@ -155,294 +155,339 @@ static __device__ double atomicAdd_double(double *address, double val)
 #endif
 }
 
-// assignment kernel: one thread per point
-__global__ void assignment_kernel(const double *d_X, const double *d_C, int *d_assign, double *d_err, int N, int K)
+// ============================================================================
+// KERNEL 1: Compute ALL distances in parallel (N x K threads)
+// NO LOOPS! Each thread computes ONE distance
+// ============================================================================
+__global__ void compute_distances_kernel(const double *d_X, const double *d_C,
+                                         double *d_distances, int N, int K)
 {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= N)
+    int i = blockIdx.y * blockDim.y + threadIdx.y; // point index
+    int c = blockIdx.x * blockDim.x + threadIdx.x; // centroid index
+
+    if (i >= N || c >= K)
         return;
-    double xi = d_X[i];
-    double bestd = 1e300;
-    int best = -1;
-    for (int c = 0; c < K; c++)
-    {
-        double diff = xi - d_C[c];
-        double d = diff * diff;
-        if (d < bestd)
-        {
-            bestd = d;
-            best = c;
-        }
-    }
-    d_assign[i] = best;
-    d_err[i] = bestd;
+
+    // Each thread computes ONE distance - FULLY PARALLEL!
+    double diff = d_X[i] - d_C[c];
+    d_distances[i * K + c] = diff * diff;
 }
 
-// update kernel using atomics: accumulate sum and count
-__global__ void update_atomic_kernel(const double *d_X, const int *d_assign, double *d_sum, int *d_cnt, int N)
+// ============================================================================
+// KERNEL 2: Find minimum distance for each point using parallel reduction
+// Each block processes ONE point, threads reduce over K centroids
+// ============================================================================
+__global__ void find_min_distances_kernel(const double *d_distances,
+                                          int *d_assign, double *d_err, int N, int K)
+{
+    int i = blockIdx.x; // each block = one point
+    int tid = threadIdx.x;
+
+    if (i >= N)
+        return;
+
+    extern __shared__ double s_dist[];
+    int *s_idx = (int *)&s_dist[blockDim.x];
+
+    // Each thread finds local minimum over its assigned centroids
+    double local_min = 1e300;
+    int local_idx = -1;
+
+    for (int c = tid; c < K; c += blockDim.x)
+    {
+        double dist = d_distances[i * K + c];
+        if (dist < local_min)
+        {
+            local_min = dist;
+            local_idx = c;
+        }
+    }
+
+    s_dist[tid] = local_min;
+    s_idx[tid] = local_idx;
+    __syncthreads();
+
+    // Parallel reduction in shared memory (tree reduction)
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
+    {
+        if (tid < stride && s_dist[tid + stride] < s_dist[tid])
+        {
+            s_dist[tid] = s_dist[tid + stride];
+            s_idx[tid] = s_idx[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    // Thread 0 writes final result
+    if (tid == 0)
+    {
+        d_assign[i] = s_idx[0];
+        d_err[i] = s_dist[0];
+    }
+}
+
+// ============================================================================
+// KERNEL 3: Parallel SSE reduction using tree reduction
+// ============================================================================
+__global__ void reduce_sse_kernel(const double *d_err, double *d_partial_sse, int N)
+{
+    extern __shared__ double s_data[];
+
+    int tid = threadIdx.x;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Load data into shared memory
+    s_data[tid] = (i < N) ? d_err[i] : 0.0;
+    __syncthreads();
+
+    // Tree reduction in shared memory
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
+    {
+        if (tid < stride)
+        {
+            s_data[tid] += s_data[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    // Write block result to global memory
+    if (tid == 0)
+    {
+        d_partial_sse[blockIdx.x] = s_data[0];
+    }
+}
+
+// ============================================================================
+// KERNEL 4: Update centroids using atomics (parallel accumulation)
+// ============================================================================
+__global__ void update_atomic_kernel(const double *d_X, const int *d_assign,
+                                     double *d_sum, int *d_cnt, int N)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N)
         return;
+
     int a = d_assign[i];
-    // atomic add for double
     atomicAdd_double(&d_sum[a], d_X[i]);
     atomicAdd(&d_cnt[a], 1);
 }
 
+// ============================================================================
+// KERNEL 5: Finalize centroids on GPU (parallel division)
+// ============================================================================
+__global__ void finalize_centroids_kernel(double *d_C, const double *d_sum,
+                                          const int *d_cnt, const double *d_X, int K)
+{
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= K)
+        return;
+
+    if (d_cnt[c] > 0)
+        d_C[c] = d_sum[c] / (double)d_cnt[c];
+    else
+        d_C[c] = d_X[0]; // fallback
+}
+
+// ============================================================================
+// MAIN
+// ============================================================================
 int main(int argc, char **argv)
 {
     if (argc < 3)
     {
-        printf("Uso: %s dados.csv centroides_iniciais.csv [max_iter=50] [eps=1e-4] [update=host|gpu] [block=256] [assign_out] [centroids_out]\n", argv[0]);
-        printf("Obs: arquivos CSV com 1 coluna (1 valor por linha), sem cabeçalho.\n");
+        printf("Uso: %s dados.csv centroides.csv [max_iter=50] [eps=1e-4] [block=256] [assign_out] [centroids_out]\n", argv[0]);
         return 1;
     }
+
     const char *pathX = argv[1];
     const char *pathC = argv[2];
     int max_iter = (argc > 3) ? atoi(argv[3]) : 50;
     double eps = (argc > 4) ? atof(argv[4]) : 1e-4;
-    const char *update_mode_str = (argc > 5) ? argv[5] : "host";
-    int blocksize = (argc > 6) ? atoi(argv[6]) : 256;
-    const char *outAssign = (argc > 7) ? argv[7] : NULL;
-    const char *outCentroid = (argc > 8) ? argv[8] : NULL;
+    int blocksize = (argc > 5) ? atoi(argv[5]) : 256;
+    const char *outAssign = (argc > 6) ? argv[6] : NULL;
+    const char *outCentroid = (argc > 7) ? argv[7] : NULL;
 
-    int update_gpu = (strcmp(update_mode_str, "gpu") == 0) ? 1 : 0;
-
-    if (max_iter <= 0 || eps <= 0.0)
-    {
-        fprintf(stderr, "Parâmetros inválidos: max_iter>0 e eps>0\n");
-        return 1;
-    }
-
+    // Read data
     int N = 0, K = 0;
     double *h_X = read_csv_1col(pathX, &N);
     double *h_C = read_csv_1col(pathC, &K);
     int *h_assign = (int *)malloc((size_t)N * sizeof(int));
     double *h_err = (double *)malloc((size_t)N * sizeof(double));
-    if (!h_assign || !h_err)
-    {
-        fprintf(stderr, "Sem memoria host\n");
-        return 1;
-    }
 
-    // Device buffers
-    double *d_X = NULL;
-    double *d_C = NULL;
-    int *d_assign = NULL;
-    double *d_err = NULL;
+    // Allocate device memory
+    double *d_X, *d_C, *d_distances;
+    int *d_assign;
+    double *d_err, *d_sum;
+    int *d_cnt;
 
-    CHECK(cudaMalloc((void **)&d_X, (size_t)N * sizeof(double)));
-    CHECK(cudaMalloc((void **)&d_C, (size_t)K * sizeof(double)));
-    CHECK(cudaMalloc((void **)&d_assign, (size_t)N * sizeof(int)));
-    CHECK(cudaMalloc((void **)&d_err, (size_t)N * sizeof(double)));
+    CHECK(cudaMalloc(&d_X, (size_t)N * sizeof(double)));
+    CHECK(cudaMalloc(&d_C, (size_t)K * sizeof(double)));
+    CHECK(cudaMalloc(&d_distances, (size_t)N * K * sizeof(double)));
+    CHECK(cudaMalloc(&d_assign, (size_t)N * sizeof(int)));
+    CHECK(cudaMalloc(&d_err, (size_t)N * sizeof(double)));
+    CHECK(cudaMalloc(&d_sum, (size_t)K * sizeof(double)));
+    CHECK(cudaMalloc(&d_cnt, (size_t)K * sizeof(int)));
 
-    // For atomic update option
-    double *d_sum = NULL;
-    int *d_cnt = NULL;
-    if (update_gpu)
-    {
-        CHECK(cudaMalloc((void **)&d_sum, (size_t)K * sizeof(double)));
-        CHECK(cudaMalloc((void **)&d_cnt, (size_t)K * sizeof(int)));
-    }
+    // For SSE reduction
+    int grid_sse = (N + blocksize - 1) / blocksize;
+    double *d_partial_sse, *h_partial_sse;
+    CHECK(cudaMalloc(&d_partial_sse, (size_t)grid_sse * sizeof(double)));
+    h_partial_sse = (double *)malloc((size_t)grid_sse * sizeof(double));
 
-    // copy initial data H2D
+    // Copy initial data H2D
     clock_t t0_total = clock();
-    double h2d_time_ms = 0.0, d2h_time_ms = 0.0;
-    clock_t t0 = clock();
     CHECK(cudaMemcpy(d_X, h_X, (size_t)N * sizeof(double), cudaMemcpyHostToDevice));
     CHECK(cudaMemcpy(d_C, h_C, (size_t)K * sizeof(double), cudaMemcpyHostToDevice));
-    clock_t t1 = clock();
-    h2d_time_ms += 1000.0 * (double)(t1 - t0) / (double)CLOCKS_PER_SEC;
 
-    int grid = (N + blocksize - 1) / blocksize;
+    // Setup 2D grid for distance computation (N x K threads)
+    dim3 block2d(16, 16); // 16x16 = 256 threads per block
+    dim3 grid2d((K + block2d.x - 1) / block2d.x, (N + block2d.y - 1) / block2d.y);
 
-    // Events for kernel timing
+    // Events for timing
     cudaEvent_t ev_start, ev_stop;
     CHECK(cudaEventCreate(&ev_start));
     CHECK(cudaEventCreate(&ev_stop));
 
-    float total_kernel_ms = 0.0f;
-    float total_update_kernel_ms = 0.0f;
+    float total_dist_ms = 0.0f, total_assign_ms = 0.0f;
+    float total_sse_ms = 0.0f, total_update_ms = 0.0f, total_finalize_ms = 0.0f;
 
-    double prev_sse = 1e300;
-    double sse = 0.0;
+    double prev_sse = 1e300, sse = 0.0;
     int iters = 0;
+
+    printf("\n========================================\n");
+    printf("K-means 1D CUDA (FULLY PARALLELIZED)\n");
+    printf("========================================\n");
+    printf("Dataset: N=%d pontos | K=%d clusters\n", N, K);
+    printf("Total threads para distancias: %d x %d = %d\n", N, K, N * K);
+    printf("========================================\n\n");
 
     for (int it = 0; it < max_iter; it++)
     {
-        // assignment kernel
-        CHECK(cudaEventRecord(ev_start, 0));
-        assignment_kernel<<<grid, blocksize>>>(d_X, d_C, d_assign, d_err, N, K);
-        CHECK(cudaEventRecord(ev_stop, 0));
+        // STEP 1: Compute ALL distances in parallel (N*K threads)
+        CHECK(cudaEventRecord(ev_start));
+        compute_distances_kernel<<<grid2d, block2d>>>(d_X, d_C, d_distances, N, K);
+        CHECK(cudaEventRecord(ev_stop));
         CHECK(cudaEventSynchronize(ev_stop));
-        float ms;
-        CHECK(cudaEventElapsedTime(&ms, ev_start, ev_stop));
-        total_kernel_ms += ms;
+        float ms1;
+        CHECK(cudaEventElapsedTime(&ms1, ev_start, ev_stop));
+        total_dist_ms += ms1;
 
-        // copy errors back to host and compute sse (could do device reduction)
-        clock_t t2 = clock();
-        CHECK(cudaMemcpy(h_err, d_err, (size_t)N * sizeof(double), cudaMemcpyDeviceToHost));
-        clock_t t3 = clock();
-        d2h_time_ms += 1000.0 * (double)(t3 - t2) / (double)CLOCKS_PER_SEC;
+        // STEP 2: Find minimum distance for each point (parallel reduction)
+        size_t shared_size = blocksize * (sizeof(double) + sizeof(int));
+        CHECK(cudaEventRecord(ev_start));
+        find_min_distances_kernel<<<N, blocksize, shared_size>>>(d_distances, d_assign, d_err, N, K);
+        CHECK(cudaEventRecord(ev_stop));
+        CHECK(cudaEventSynchronize(ev_stop));
+        float ms2;
+        CHECK(cudaEventElapsedTime(&ms2, ev_start, ev_stop));
+        total_assign_ms += ms2;
 
+        // STEP 3: Compute SSE with parallel reduction
+        CHECK(cudaEventRecord(ev_start));
+        reduce_sse_kernel<<<grid_sse, blocksize, blocksize * sizeof(double)>>>(d_err, d_partial_sse, N);
+        CHECK(cudaEventRecord(ev_stop));
+        CHECK(cudaEventSynchronize(ev_stop));
+        float ms3;
+        CHECK(cudaEventElapsedTime(&ms3, ev_start, ev_stop));
+        total_sse_ms += ms3;
+
+        // Final SSE reduction on CPU (small array)
+        CHECK(cudaMemcpy(h_partial_sse, d_partial_sse, (size_t)grid_sse * sizeof(double), cudaMemcpyDeviceToHost));
         sse = 0.0;
-        for (int i = 0; i < N; i++)
-            sse += h_err[i];
+        for (int b = 0; b < grid_sse; b++)
+            sse += h_partial_sse[b];
 
+        // Check convergence
         double rel = fabs(sse - prev_sse) / (prev_sse > 0.0 ? prev_sse : 1.0);
         iters = it + 1;
+
+        printf("Iter %2d: SSE = %.6f (rel_change = %.6e)\n", it + 1, sse, rel);
+
         if (rel < eps)
         {
+            printf("Convergiu!\n");
             break;
         }
 
-        if (update_gpu)
-        {
-            // zero sum and cnt
-            CHECK(cudaMemset(d_sum, 0, (size_t)K * sizeof(double)));
-            CHECK(cudaMemset(d_cnt, 0, (size_t)K * sizeof(int)));
-            // update kernel using atomics
-            CHECK(cudaEventRecord(ev_start, 0));
-            update_atomic_kernel<<<grid, blocksize>>>(d_X, d_assign, d_sum, d_cnt, N);
-            CHECK(cudaEventRecord(ev_stop, 0));
-            CHECK(cudaEventSynchronize(ev_stop));
-            float ms2;
-            CHECK(cudaEventElapsedTime(&ms2, ev_start, ev_stop));
-            total_update_kernel_ms += ms2;
+        // STEP 4: Update centroids
+        CHECK(cudaMemset(d_sum, 0, (size_t)K * sizeof(double)));
+        CHECK(cudaMemset(d_cnt, 0, (size_t)K * sizeof(int)));
 
-            // copy sums back and finalize centroids on host
-            clock_t t4 = clock();
-            double *h_sum = (double *)malloc((size_t)K * sizeof(double));
-            int *h_cnt = (int *)malloc((size_t)K * sizeof(int));
-            if (!h_sum || !h_cnt)
-            {
-                fprintf(stderr, "Sem memoria host para sums\n");
-                exit(1);
-            }
-            CHECK(cudaMemcpy(h_sum, d_sum, (size_t)K * sizeof(double), cudaMemcpyDeviceToHost));
-            CHECK(cudaMemcpy(h_cnt, d_cnt, (size_t)K * sizeof(int), cudaMemcpyDeviceToHost));
-            clock_t t5 = clock();
-            d2h_time_ms += 1000.0 * (double)(t5 - t4) / (double)CLOCKS_PER_SEC;
+        int grid_update = (N + blocksize - 1) / blocksize;
+        CHECK(cudaEventRecord(ev_start));
+        update_atomic_kernel<<<grid_update, blocksize>>>(d_X, d_assign, d_sum, d_cnt, N);
+        CHECK(cudaEventRecord(ev_stop));
+        CHECK(cudaEventSynchronize(ev_stop));
+        float ms4;
+        CHECK(cudaEventElapsedTime(&ms4, ev_start, ev_stop));
+        total_update_ms += ms4;
 
-            for (int c = 0; c < K; c++)
-            {
-                if (h_cnt[c] > 0)
-                    h_C[c] = h_sum[c] / (double)h_cnt[c];
-                else
-                    h_C[c] = h_X[0];
-            }
-            free(h_sum);
-            free(h_cnt);
-
-            // copy updated centroids to device
-            clock_t t6 = clock();
-            CHECK(cudaMemcpy(d_C, h_C, (size_t)K * sizeof(double), cudaMemcpyHostToDevice));
-            clock_t t7 = clock();
-            h2d_time_ms += 1000.0 * (double)(t7 - t6) / (double)CLOCKS_PER_SEC;
-        }
-        else
-        {
-            // copy assign back to host and compute centroids on host
-            clock_t t8 = clock();
-            CHECK(cudaMemcpy(h_assign, d_assign, (size_t)N * sizeof(int), cudaMemcpyDeviceToHost));
-            clock_t t9 = clock();
-            d2h_time_ms += 1000.0 * (double)(t9 - t8) / (double)CLOCKS_PER_SEC;
-
-            // compute sums and counts
-            double *sum = (double *)calloc((size_t)K, sizeof(double));
-            int *cnt = (int *)calloc((size_t)K, sizeof(int));
-            if (!sum || !cnt)
-            {
-                fprintf(stderr, "Sem memoria host em update\n");
-                exit(1);
-            }
-            for (int i = 0; i < N; i++)
-            {
-                int a = h_assign[i];
-                cnt[a] += 1;
-                sum[a] += h_X[i];
-            }
-            for (int c = 0; c < K; c++)
-            {
-                if (cnt[c] > 0)
-                    h_C[c] = sum[c] / (double)cnt[c];
-                else
-                    h_C[c] = h_X[0];
-            }
-            free(sum);
-            free(cnt);
-
-            // copy centroids back
-            clock_t t10 = clock();
-            CHECK(cudaMemcpy(d_C, h_C, (size_t)K * sizeof(double), cudaMemcpyHostToDevice));
-            clock_t t11 = clock();
-            h2d_time_ms += 1000.0 * (double)(t11 - t10) / (double)CLOCKS_PER_SEC;
-        }
+        // STEP 5: Finalize centroids on GPU
+        int grid_finalize = (K + 256 - 1) / 256;
+        CHECK(cudaEventRecord(ev_start));
+        finalize_centroids_kernel<<<grid_finalize, 256>>>(d_C, d_sum, d_cnt, d_X, K);
+        CHECK(cudaEventRecord(ev_stop));
+        CHECK(cudaEventSynchronize(ev_stop));
+        float ms5;
+        CHECK(cudaEventElapsedTime(&ms5, ev_start, ev_stop));
+        total_finalize_ms += ms5;
 
         prev_sse = sse;
     }
 
-    clock_t t_total_end = clock();
-    double total_ms = 1000.0 * (double)(t_total_end - t0_total) / (double)CLOCKS_PER_SEC;
+    clock_t t_end = clock();
+    double total_time_ms = 1000.0 * (double)(t_end - t0_total) / (double)CLOCKS_PER_SEC;
 
-    // copy final assignments and centroids to host
-    clock_t t12 = clock();
+    // Copy final results
     CHECK(cudaMemcpy(h_assign, d_assign, (size_t)N * sizeof(int), cudaMemcpyDeviceToHost));
     CHECK(cudaMemcpy(h_C, d_C, (size_t)K * sizeof(double), cudaMemcpyDeviceToHost));
-    clock_t t13 = clock();
-    d2h_time_ms += 1000.0 * (double)(t13 - t12) / (double)CLOCKS_PER_SEC;
 
+    // Print results
     printf("\n========================================\n");
-    printf("K-means 1D (CUDA)\n");
+    printf("RESULTADOS FINAIS\n");
     printf("========================================\n");
-    printf("Dataset: N=%d pontos | K=%d clusters\n", N, K);
-    printf("Parametros: max_iter=%d | eps=%g | update=%s | block=%d\n", max_iter, eps, update_gpu ? "gpu(atomics)" : "host", blocksize);
-    printf("----------------------------------------\n");
-    printf("Iteracoes realizadas: %d\n", iters);
+    printf("Iteracoes: %d\n", iters);
     printf("SSE final: %.6f\n", sse);
     printf("----------------------------------------\n");
-    printf("TEMPOS (ms):\n");
-    printf("  H2D total: %.3f ms\n", h2d_time_ms);
-    printf("  Kernel assign total: %.3f ms\n", total_kernel_ms);
-    if (update_gpu)
-        printf("  Kernel update (atomics) total: %.3f ms\n", total_update_kernel_ms);
-    printf("  D2H total: %.3f ms\n", d2h_time_ms);
-    printf("  Tempo total: %.3f ms\n", total_ms);
+    printf("TEMPOS DE KERNEL (ms):\n");
+    printf("  Distancias (N*K threads): %.3f ms\n", total_dist_ms);
+    printf("  Assignment (reducao):     %.3f ms\n", total_assign_ms);
+    printf("  SSE reduction:            %.3f ms\n", total_sse_ms);
+    printf("  Update (atomics):         %.3f ms\n", total_update_ms);
+    printf("  Finalize centroids:       %.3f ms\n", total_finalize_ms);
+    printf("  TOTAL GPU:                %.3f ms\n",
+           total_dist_ms + total_assign_ms + total_sse_ms + total_update_ms + total_finalize_ms);
+    printf("  TOTAL (com CPU/IO):       %.3f ms\n", total_time_ms);
     printf("----------------------------------------\n");
 
-    double ms_kmeans = total_kernel_ms + total_update_kernel_ms + h2d_time_ms + d2h_time_ms; // approx
-    double ms_per_iter = (iters > 0) ? (ms_kmeans / (double)iters) : 0.0;
-    double total_ops = (double)N * (double)K * (double)iters;
-    double throughput_ops = (ms_kmeans > 0) ? (total_ops / (ms_kmeans / 1000.0)) : 0.0;
-    double throughput_points = (ms_kmeans > 0) ? ((double)N * (double)iters / (ms_kmeans / 1000.0)) : 0.0;
-
+    double kernel_time = total_dist_ms + total_assign_ms + total_sse_ms + total_update_ms + total_finalize_ms;
+    double ops_per_sec = ((double)N * (double)K * (double)iters) / (kernel_time / 1000.0);
     printf("THROUGHPUT:\n");
-    printf("  Operacoes totais: %.2e\n", total_ops);
-    printf("  Operacoes/segundo: %.2e ops/s\n", throughput_ops);
-    printf("  Pontos/segundo: %.2e pts/s\n", throughput_points);
+    printf("  Operacoes/segundo: %.2e ops/s\n", ops_per_sec);
+    printf("  Tempo por iteracao: %.3f ms\n", kernel_time / (double)iters);
     printf("========================================\n");
 
-    // write outputs
+    // Write outputs
     write_assign_csv(outAssign, h_assign, N);
     write_centroids_csv(outCentroid, h_C, K);
 
-    // cleanup
-    cudaEventDestroy(ev_start);
-    cudaEventDestroy(ev_stop);
-    if (d_sum)
-        cudaFree(d_sum);
-    if (d_cnt)
-        cudaFree(d_cnt);
+    // Cleanup
     cudaFree(d_X);
     cudaFree(d_C);
+    cudaFree(d_distances);
     cudaFree(d_assign);
     cudaFree(d_err);
+    cudaFree(d_sum);
+    cudaFree(d_cnt);
+    cudaFree(d_partial_sse);
+    cudaEventDestroy(ev_start);
+    cudaEventDestroy(ev_stop);
 
     free(h_X);
     free(h_C);
     free(h_assign);
     free(h_err);
+    free(h_partial_sse);
 
     return 0;
 }
